@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import AVFoundation
+import Darwin
 
 private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
     override func drawingRect(forBounds rect: NSRect) -> NSRect {
@@ -2164,6 +2165,20 @@ private enum DictationError: LocalizedError {
     }
 }
 
+private struct ProcessResult {
+    let status: Int32
+    let stdout: String
+    let stderr: String
+    let timedOut: Bool
+}
+
+private enum RecognizerState {
+    case loading
+    case ready
+    case recovering
+    case fallback
+}
+
 private final class DictationController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let modelPath = NSString(
         string: "~/Library/Application Support/superwhisper/ggml-large.bin"
@@ -2176,6 +2191,10 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
     private var audioFile: AVAudioFile?
     private var sourceAudioURL: URL?
     private var recognizerServer: Process?
+    private let recognizerLock = NSLock()
+    private let transcriptionQueue = DispatchQueue(label: "ru.specit.Sayo.transcription", qos: .userInitiated)
+    private var recognizerState: RecognizerState = .loading
+    private var recognizerHealthTimer: Timer?
     private var permissionRecoveryTimer: Timer?
     private let hud = RecordingHUD()
     private var statusLineItem: NSMenuItem!
@@ -2183,6 +2202,8 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
     private var historyMenu: NSMenu!
     private var themeMenu: NSMenu!
     private var autoPasteItem: NSMenuItem!
+    private var retryRecoveryItem: NSMenuItem!
+    private var discardRecoveryItem: NSMenuItem!
     private var hotkeyStatusItem: NSMenuItem!
     private var inputMonitoringStatusItem: NSMenuItem!
     private var microphoneStatusItem: NSMenuItem!
@@ -2199,6 +2220,13 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
     private let idleIcon = "waveform"
     private let recordingIcon = "record.circle.fill"
     private let workingIcon = "ellipsis.circle"
+    private let recoveryDirectoryURL: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base
+            .appendingPathComponent("Sayo", isDirectory: true)
+            .appendingPathComponent("Recovery", isDirectory: true)
+    }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if ProcessInfo.processInfo.arguments.contains("--preview-settings") {
@@ -2230,7 +2258,7 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
         installRightCommandTap(showFailure: true)
         startPermissionRecovery()
         requestMicrophonePermission()
-        startRecognizerServer()
+        warmUpRecognizerServer()
     }
 
     private func runHUDPreviewCycle() {
@@ -2256,6 +2284,8 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
     func applicationWillTerminate(_ notification: Notification) {
         permissionRecoveryTimer?.invalidate()
         permissionRecoveryTimer = nil
+        recognizerHealthTimer?.invalidate()
+        recognizerHealthTimer = nil
         stopRecordingWithoutTranscription()
         stopRecognizerServer()
         if let eventTapSource {
@@ -2324,6 +2354,24 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
         historyRoot.submenu = historyMenu
         menu.addItem(historyRoot)
         rebuildHistoryMenu()
+
+        retryRecoveryItem = NSMenuItem(
+            title: "Повторить сохранённую запись",
+            action: #selector(retryFailedRecording),
+            keyEquivalent: ""
+        )
+        retryRecoveryItem.target = self
+        retryRecoveryItem.image = menuSymbol("arrow.clockwise.circle")
+        menu.addItem(retryRecoveryItem)
+
+        discardRecoveryItem = NSMenuItem(
+            title: "Удалить сохранённые записи…",
+            action: #selector(discardFailedRecordings),
+            keyEquivalent: ""
+        )
+        discardRecoveryItem.target = self
+        discardRecoveryItem.image = menuSymbol("trash")
+        menu.addItem(discardRecoveryItem)
         menu.addItem(.separator())
 
         hotkeyStatusItem = NSMenuItem(title: "Правый ⌘: проверяю…", action: nil, keyEquivalent: "")
@@ -2394,6 +2442,15 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
         toggleMenuItem.image = menuSymbol(isRecording ? "stop.circle.fill" : "waveform")
         toggleMenuItem.isEnabled = !isTranscribing
 
+        let recoveryCount = recoverableRecordings().count
+        retryRecoveryItem.title = recoveryCount > 1
+            ? "Повторить сохранённую запись (\(recoveryCount))"
+            : "Повторить сохранённую запись"
+        retryRecoveryItem.isHidden = recoveryCount == 0
+        retryRecoveryItem.isEnabled = recoveryCount > 0 && !isRecording && !isTranscribing
+        discardRecoveryItem.isHidden = recoveryCount == 0
+        discardRecoveryItem.isEnabled = recoveryCount > 0 && !isRecording && !isTranscribing
+
         let selectedTheme = hud.selectedTheme()
         themeMenu?.items.forEach { item in
             item.state = item.representedObject as? String == selectedTheme.rawValue ? .on : .off
@@ -2427,10 +2484,17 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
 
         if !FileManager.default.fileExists(atPath: modelPath) {
             serverStatusItem.title = "Whisper Large: модель не найдена"
-        } else if recognizerServer?.isRunning == true {
-            serverStatusItem.title = "Whisper Large: Metal GPU"
         } else {
-            serverStatusItem.title = "Whisper Large: резервный режим"
+            switch recognizerState {
+            case .loading:
+                serverStatusItem.title = "Whisper Large: загружается локально…"
+            case .ready:
+                serverStatusItem.title = "Whisper Large: Metal GPU готов"
+            case .recovering:
+                serverStatusItem.title = "Whisper Large: перезапускаю локально…"
+            case .fallback:
+                serverStatusItem.title = "Whisper Large: резервный запуск модели"
+            }
         }
     }
 
@@ -2592,6 +2656,56 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
         rebuildHistoryMenu()
     }
 
+    private func ensureRecoveryDirectory() throws {
+        try FileManager.default.createDirectory(
+            at: recoveryDirectoryURL,
+            withIntermediateDirectories: true
+        )
+    }
+
+    private func recoverableRecordings() -> [URL] {
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: recoveryDirectoryURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        return urls
+            .filter { url in
+                url.pathExtension == "caf" && url != sourceAudioURL
+            }
+            .sorted { lhs, rhs in
+                let leftDate = try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+                let rightDate = try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+                return (leftDate ?? .distantPast) > (rightDate ?? .distantPast)
+            }
+    }
+
+    @objc private func retryFailedRecording() {
+        guard !isRecording, !isTranscribing,
+              let sourceURL = recoverableRecordings().first else { return }
+        beginTranscription(of: sourceURL, isRecovery: true)
+    }
+
+    @objc private func discardFailedRecordings() {
+        let recordings = recoverableRecordings()
+        guard !recordings.isEmpty else { return }
+
+        let alert = NSAlert()
+        alert.messageText = recordings.count == 1
+            ? "Удалить сохранённую запись?"
+            : "Удалить сохранённые записи (\(recordings.count))?"
+        alert.informativeText = "После удаления повторить локальное распознавание будет нельзя."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Удалить")
+        alert.addButton(withTitle: "Отмена")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        recordings.forEach { try? FileManager.default.removeItem(at: $0) }
+        setStatus(icon: idleIcon, title: "Сохранённые записи удалены")
+        refreshMenuState()
+    }
+
     private func toggleDictation() {
         if isTranscribing { return }
         if isRecording {
@@ -2620,9 +2734,13 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
                 throw DictationError.noInputDevice
             }
 
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent("right-command-\(UUID().uuidString).caf")
+            try ensureRecoveryDirectory()
+            let url = recoveryDirectoryURL
+                .appendingPathComponent("dictation-\(UUID().uuidString).caf")
             let file = try AVAudioFile(forWriting: url, settings: format.settings)
+            audioEngine = engine
+            audioFile = file
+            sourceAudioURL = url
 
             input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
                 try? file.write(from: buffer)
@@ -2645,9 +2763,6 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             engine.prepare()
             try engine.start()
 
-            audioEngine = engine
-            audioFile = file
-            sourceAudioURL = url
             isRecording = true
             recordingStartedAt = Date()
             setStatus(icon: recordingIcon, title: "Запись… правый ⌘ — готово, Esc — отмена")
@@ -2676,33 +2791,36 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             return
         }
 
+        beginTranscription(of: sourceURL, isRecovery: false)
+    }
+
+    private func beginTranscription(of sourceURL: URL, isRecovery: Bool) {
         isTranscribing = true
-        setStatus(icon: workingIcon, title: "Распознаю речь…")
+        setStatus(
+            icon: workingIcon,
+            title: isRecovery ? "Повторяю локальное распознавание…" : "Распознаю речь…"
+        )
         hud.showProcessing()
         refreshMenuState()
         NSSound(named: "Pop")?.play()
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        transcriptionQueue.async { [weak self] in
             guard let self else { return }
-            defer {
-                try? FileManager.default.removeItem(at: sourceURL)
-                DispatchQueue.main.async {
-                    self.isTranscribing = false
-                    self.setStatus(icon: self.idleIcon, title: "Готово — нажмите правый ⌘")
-                    self.refreshMenuState()
-                }
-            }
 
             do {
                 let wavURL = try self.convertToWhisperWAV(sourceURL)
                 defer { try? FileManager.default.removeItem(at: wavURL) }
                 let transcript = try self.transcribe(wavURL)
                 DispatchQueue.main.async {
+                    self.isTranscribing = false
                     self.copyAndPaste(transcript)
+                    try? FileManager.default.removeItem(at: sourceURL)
+                    self.refreshMenuState()
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self.showError(error.localizedDescription)
+                    self.isTranscribing = false
+                    self.showError("\(error.localizedDescription). Запись сохранена — можно повторить из меню")
                 }
             }
         }
@@ -2749,7 +2867,7 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             "-i", input.path,
             "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
             output.path
-        ])
+        ], timeout: 60)
         guard result.status == 0 else {
             throw DictationError.conversionFailed(result.stderr)
         }
@@ -2757,22 +2875,64 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
     }
 
     private func transcribe(_ input: URL) throws -> String {
-        do {
-            return try transcribeThroughServer(input)
-        } catch {
-            // If the persistent server could not start (for example, its port is
-            // occupied), one-shot CPU recognition still gives the user a result.
-            return try transcribeThroughCLI(input)
+        if ensureRecognizerServerReady(maxWait: 20, stateWhileStarting: .recovering) {
+            do {
+                return try transcribeThroughServer(input)
+            } catch {
+                updateRecognizerState(.recovering)
+                stopRecognizerServer()
+                if ensureRecognizerServerReady(maxWait: 20, stateWhileStarting: .recovering),
+                   let transcript = try? transcribeThroughServer(input) {
+                    return transcript
+                }
+            }
+        }
+
+        updateRecognizerState(.fallback)
+        return try transcribeThroughCLI(input)
+    }
+
+    private func warmUpRecognizerServer() {
+        updateRecognizerState(.loading)
+        transcriptionQueue.async { [weak self] in
+            _ = self?.ensureRecognizerServerReady(maxWait: 20, stateWhileStarting: .loading)
+        }
+
+        recognizerHealthTimer?.invalidate()
+        recognizerHealthTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            guard let self, !self.isRecording, !self.isTranscribing else { return }
+            self.transcriptionQueue.async { [weak self] in
+                guard let self else { return }
+                if !self.recognizerServerIsHealthy() {
+                    _ = self.ensureRecognizerServerReady(maxWait: 20, stateWhileStarting: .recovering)
+                }
+            }
+        }
+        if let recognizerHealthTimer {
+            RunLoop.main.add(recognizerHealthTimer, forMode: .common)
         }
     }
 
-    private func startRecognizerServer() {
-        guard recognizerServer == nil,
-              FileManager.default.fileExists(atPath: modelPath),
+    private func updateRecognizerState(_ state: RecognizerState) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.recognizerState = state
+            self.refreshMenuState()
+        }
+    }
+
+    private func recognizerProcess() -> Process? {
+        recognizerLock.lock()
+        defer { recognizerLock.unlock() }
+        return recognizerServer
+    }
+
+    private func startRecognizerServerProcess() -> Bool {
+        guard FileManager.default.fileExists(atPath: modelPath),
               let server = locateExecutable(candidates: [
                   "/opt/homebrew/bin/whisper-server",
                   "/usr/local/bin/whisper-server"
-              ]) else { return }
+              ]) else { return false }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: server)
@@ -2789,40 +2949,87 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
 
         do {
             try process.run()
+            recognizerLock.lock()
             recognizerServer = process
-            setStatus(icon: workingIcon, title: "Загружаю локальную модель…")
-            refreshMenuState()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                guard let self, !self.isRecording, !self.isTranscribing else { return }
-                self.setStatus(icon: self.idleIcon, title: "Готово — нажмите правый ⌘")
-            }
+            recognizerLock.unlock()
+            return true
         } catch {
+            recognizerLock.lock()
             recognizerServer = nil
+            recognizerLock.unlock()
+            return false
         }
     }
 
     private func stopRecognizerServer() {
-        guard let process = recognizerServer else { return }
-        if process.isRunning { process.terminate() }
+        recognizerLock.lock()
+        let process = recognizerServer
         recognizerServer = nil
-        refreshMenuState()
+        recognizerLock.unlock()
+
+        guard let process, process.isRunning else { return }
+        process.terminate()
+        let deadline = Date().addingTimeInterval(2)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if process.isRunning {
+            Darwin.kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
+    }
+
+    private func recognizerServerIsHealthy() -> Bool {
+        guard recognizerProcess()?.isRunning == true else { return false }
+        let result = runProcess("/usr/bin/curl", arguments: [
+            "--silent", "--show-error", "--fail",
+            "--connect-timeout", "1", "--max-time", "2",
+            "--output", "/dev/null",
+            "http://127.0.0.1:18080/"
+        ], timeout: 3)
+        return result.status == 0
+    }
+
+    private func ensureRecognizerServerReady(
+        maxWait: TimeInterval,
+        stateWhileStarting: RecognizerState
+    ) -> Bool {
+        if recognizerServerIsHealthy() {
+            updateRecognizerState(.ready)
+            return true
+        }
+
+        stopRecognizerServer()
+        updateRecognizerState(stateWhileStarting)
+        guard startRecognizerServerProcess() else {
+            updateRecognizerState(.fallback)
+            return false
+        }
+
+        let deadline = Date().addingTimeInterval(maxWait)
+        while Date() < deadline {
+            guard recognizerProcess()?.isRunning == true else { break }
+            if recognizerServerIsHealthy() {
+                updateRecognizerState(.ready)
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+
+        stopRecognizerServer()
+        updateRecognizerState(.fallback)
+        return false
     }
 
     private func transcribeThroughServer(_ input: URL) throws -> String {
-        if recognizerServer?.isRunning != true {
-            recognizerServer = nil
-            startRecognizerServer()
-        }
-
         let result = runProcess("/usr/bin/curl", arguments: [
             "--silent", "--show-error", "--fail-with-body",
-            "--retry", "30", "--retry-all-errors", "--retry-delay", "1",
-            "--max-time", "180",
+            "--connect-timeout", "2", "--max-time", "120",
             "http://127.0.0.1:18080/inference",
             "-F", "file=@\(input.path)",
             "-F", "response_format=json",
             "-F", "language=auto"
-        ])
+        ], timeout: 125)
         guard result.status == 0 else {
             throw DictationError.transcriptionFailed(result.stderr)
         }
@@ -2849,7 +3056,7 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             "-l", "auto",
             "-nt", "-np",
             "-bo", "2", "-bs", "2"
-        ])
+        ], timeout: 240)
         guard result.status == 0 else {
             throw DictationError.transcriptionFailed(result.stderr)
         }
@@ -2938,7 +3145,11 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
         candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    private func runProcess(_ executable: String, arguments: [String]) -> (status: Int32, stdout: String, stderr: String) {
+    private func runProcess(
+        _ executable: String,
+        arguments: [String],
+        timeout: TimeInterval
+    ) -> ProcessResult {
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -2949,20 +3160,61 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
 
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
-            return (-1, "", error.localizedDescription)
+            return ProcessResult(
+                status: -1,
+                stdout: "",
+                stderr: error.localizedDescription,
+                timedOut: false
+            )
         }
 
-        let stdout = String(
-            data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8
-        ) ?? ""
-        let stderr = String(
-            data: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8
-        ) ?? ""
-        return (process.terminationStatus, stdout, stderr)
+        let readGroup = DispatchGroup()
+        var stdoutData = Data()
+        var stderrData = Data()
+        readGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            readGroup.leave()
+        }
+        readGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            readGroup.leave()
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        let timedOut = process.isRunning
+        if timedOut {
+            process.terminate()
+            let terminationDeadline = Date().addingTimeInterval(2)
+            while process.isRunning && Date() < terminationDeadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if process.isRunning {
+                Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+        }
+
+        process.waitUntilExit()
+        readGroup.wait()
+
+        let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+        var stderr = String(data: stderrData, encoding: .utf8) ?? ""
+        if timedOut {
+            if !stderr.isEmpty && !stderr.hasSuffix("\n") { stderr += "\n" }
+            stderr += "Превышено время ожидания процесса \(URL(fileURLWithPath: executable).lastPathComponent)"
+        }
+        return ProcessResult(
+            status: timedOut ? -2 : process.terminationStatus,
+            stdout: stdout,
+            stderr: stderr,
+            timedOut: timedOut
+        )
     }
 
     private func showError(_ message: String) {
