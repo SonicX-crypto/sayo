@@ -1,4 +1,4 @@
-# Инструкции для работы над VoxCommand
+# Инструкции для работы над Sayo
 
 Перед изменениями прочитайте `PROJECT.md`, `README.md`, `docs/ARCHITECTURE.md` и
 `.planning/ROADMAP.md`.
@@ -8,16 +8,16 @@
 - Это самостоятельный macOS-проект. Не переносите его обратно в `spec-it`.
 - Не изменяйте и не удаляйте файлы Superwhisper. Модель используется только для чтения.
 - Не добавляйте `ggml-large.bin`, записи пользователя, `.build` или `dist` в Git.
-- Сохраняйте bundle ID `ru.specit.RightCommandDictation` и стабильный путь приложения,
-  пока пользователь явно не запросит полноценный ребрендинг с повторной выдачей прав.
+- Сохраняйте bundle ID `ru.specit.RightCommandDictation` и стабильный путь
+  `/Applications/Sayo.app`. Ребрендинг в Sayo утверждён 22 июля 2026 года.
 - Локальный сервер должен слушать только `127.0.0.1`.
 
 ## Сборка и проверка
 
 ```sh
 ./build-app.sh
-codesign --verify --deep --strict --verbose=2 "dist/Локальная диктовка.app"
-plutil -lint "dist/Локальная диктовка.app/Contents/Info.plist"
+codesign --verify --deep --strict --verbose=2 "dist/Sayo.app"
+plutil -lint "dist/Sayo.app/Contents/Info.plist"
 ```
 
 Для установки используйте `./install-app.sh`. После замены подписанной локально сборки
@@ -37,4 +37,3 @@ plutil -lint "dist/Локальная диктовка.app/Contents/Info.plist"
 
 Обновляйте `CHANGELOG.md` и при значимых архитектурных решениях — `PROJECT.md` или
 `docs/ARCHITECTURE.md`. Не оставляйте важные решения только в истории чата.
-

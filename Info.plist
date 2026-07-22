@@ -5,23 +5,23 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>ru</string>
     <key>CFBundleDisplayName</key>
-    <string>Локальная диктовка</string>
+    <string>Sayo</string>
     <key>CFBundleExecutable</key>
     <string>RightCommandDictation</string>
     <key>CFBundleIdentifier</key>
     <string>ru.specit.RightCommandDictation</string>
     <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
+    <string>SayoAppIcon</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Локальная диктовка</string>
+    <string>Sayo</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>0.4.2</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>6</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
@@ -29,6 +29,6 @@
     <key>LSMultipleInstancesProhibited</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Приложению нужен микрофон для локального распознавания вашей речи.</string>
+    <string>Sayo нужен микрофон для локального распознавания вашей речи.</string>
 </dict>
 </plist>

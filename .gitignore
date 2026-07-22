@@ -1,7 +1,7 @@
 .DS_Store
 .build/
 dist/
+.vscode/
 Assets/AppIcon.iconset/
 *.xcuserstate
 *.xcuserdata/
-
