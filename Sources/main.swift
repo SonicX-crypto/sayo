@@ -17,7 +17,17 @@ private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
 }
 
 private final class DraggableEffectView: NSVisualEffectView {
-    override var mouseDownCanMoveWindow: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        super.hitTest(point) == nil ? nil : self
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
 }
 
 private final class NonIntrinsicImageView: NSImageView {
@@ -1556,7 +1566,7 @@ private final class RecordingHUD {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         panel.hidesOnDeactivate = false
         panel.isMovable = true
-        panel.isMovableByWindowBackground = true
+        panel.isMovableByWindowBackground = false
         panel.animationBehavior = .utilityWindow
 
         background.material = .popover
