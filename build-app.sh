@@ -8,9 +8,10 @@ SDK="/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk"
 CACHE="/private/tmp/right-command-dictation-module-cache"
 mkdir -p "$SCRIPT_DIR/.build/release" "$CACHE"
 
-SIGNING_IDENTITY="${SAYO_SIGNING_IDENTITY:-${VOXCOMMAND_SIGNING_IDENTITY:-VoxCommand Local Development}}"
+STABLE_SIGNING_HASH="B8E2488B2F71C744DB0490CAC7BD009ED540BADC"
+SIGNING_IDENTITY="${SAYO_SIGNING_IDENTITY:-${VOXCOMMAND_SIGNING_IDENTITY:-$STABLE_SIGNING_HASH}}"
 HAS_STABLE_SIGNING_IDENTITY=0
-if security find-identity -v -p codesigning 2>/dev/null | /usr/bin/grep -Fq "\"$SIGNING_IDENTITY\""; then
+if security find-identity -v -p codesigning 2>/dev/null | /usr/bin/grep -Fq "$SIGNING_IDENTITY"; then
     HAS_STABLE_SIGNING_IDENTITY=1
 elif [[ "${SAYO_ALLOW_ADHOC_SIGNING:-0}" != "1" ]]; then
     echo "Ошибка: code-signing identity '$SIGNING_IDENTITY' не найдена." >&2

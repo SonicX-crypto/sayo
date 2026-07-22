@@ -143,7 +143,8 @@ preview не сохраняются. То же окно, открытое пун
 ## Локальная подпись
 
 `build-app.sh` собирает `dist/Sayo.app`, ищет историческую identity
-`VoxCommand Local Development` в Keychain и подписывает им сборку. Если identity
+`VoxCommand Local Development` по закреплённому SHA-1
+`B8E2488B2F71C744DB0490CAC7BD009ED540BADC` и подписывает ей сборку. Если identity
 отсутствует, обычная сборка завершается с ошибкой. Явный
 `SAYO_ALLOW_ADHOC_SIGNING=1` создаёт только тестовую сборку; `install-app.sh` всё равно
 проверяет стабильную identity и подпись до остановки работающего приложения.

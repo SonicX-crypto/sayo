@@ -41,9 +41,10 @@ cd /Users/dmitrijovcinnikov/Projects/vox-command
 
 Готовая сборка появится в `dist/Sayo.app`.
 
-Обычная сборка требует стабильную локальную identity `VoxCommand Local Development` и
-останавливается, если она недоступна. Только для отдельной неустанавливаемой проверки
-можно явно разрешить ad-hoc подпись:
+Обычная сборка требует стабильную локальную identity `VoxCommand Local Development`,
+закреплённую SHA-1 `B8E2488B2F71C744DB0490CAC7BD009ED540BADC`, и останавливается,
+если она недоступна. Только для отдельной неустанавливаемой проверки можно явно
+разрешить ad-hoc подпись:
 
 ```sh
 SAYO_ALLOW_ADHOC_SIGNING=1 ./build-app.sh
