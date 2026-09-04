@@ -2190,9 +2190,23 @@ private enum RecognizerState {
 }
 
 private final class DictationController: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private let modelPath = NSString(
-        string: "~/Library/Application Support/superwhisper/ggml-large.bin"
-    ).expandingTildeInPath
+    private var modelPath: String {
+        let defaults = UserDefaults.standard
+        let configuredPath = defaults.string(forKey: "modelPath")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidates = [
+            configuredPath,
+            "~/Library/Application Support/Sayo/Models/ggml-large-v2.bin",
+            "~/Library/Application Support/superwhisper/ggml-large.bin"
+        ]
+        .compactMap { $0 }
+        .map { NSString(string: $0).expandingTildeInPath }
+
+        return candidates.first(where: FileManager.default.fileExists(atPath:))
+            ?? NSString(
+                string: "~/Library/Application Support/Sayo/Models/ggml-large-v2.bin"
+            ).expandingTildeInPath
+    }
 
     private var statusItem: NSStatusItem!
     private var eventTap: CFMachPort?
@@ -2885,6 +2899,10 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
     }
 
     private func transcribe(_ input: URL) throws -> String {
+        guard FileManager.default.fileExists(atPath: modelPath) else {
+            throw DictationError.missingModel(modelPath)
+        }
+
         if ensureRecognizerServerReady(maxWait: 20, stateWhileStarting: .recovering) {
             do {
                 return try transcribeThroughServer(input)

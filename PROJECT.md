@@ -1,6 +1,6 @@
 # Sayo — память проекта
 
-Обновлено: 22 июля 2026 года.
+Обновлено: 4 сентября 2026 года.
 
 ## Замысел
 
@@ -11,7 +11,9 @@ Sayo — быстрая приватная диктовка для macOS, кот
 
 ## Текущее состояние
 
-Рабочая версия 0.5.0 (build 7) установлена и активна в `/Applications/Sayo.app`.
+Исходники и публичная упаковка обновлены до 0.5.1 (build 8). Рабочая версия 0.5.0
+(build 7) остаётся установленной в `/Applications/Sayo.app`; сборка 0.5.1 не
+устанавливалась и не активировалась.
 
 Реализовано:
 
@@ -43,10 +45,11 @@ Sayo — быстрая приватная диктовка для macOS, кот
 
 ## Стабильные идентификаторы и пути
 
-- исходники: `/Users/dmitrijovcinnikov/Projects/vox-command`;
+- исходники: корень Git-репозитория Sayo;
 - установленное приложение: `/Applications/Sayo.app`;
 - bundle ID: `ru.specit.RightCommandDictation`;
-- модель: `~/Library/Application Support/superwhisper/ggml-large.bin`;
+- основная модель: `~/Library/Application Support/Sayo/Models/ggml-large-v2.bin`;
+- совместимый fallback: `~/Library/Application Support/superwhisper/ggml-large.bin`;
 - сервер: `127.0.0.1:18080`, доступен только локально;
 - локальная подпись: identity `VoxCommand Local Development` в login Keychain,
   SHA-1 `B8E2488B2F71C744DB0490CAC7BD009ED540BADC`;
@@ -78,6 +81,19 @@ identity. Во время дизайн-итераций собирать отд�
 3. Полезная обратная связь без захвата фокуса.
 4. Качество важнее искусственных benchmark-ускорений.
 5. Все настройки должны иметь безопасные значения по умолчанию.
+
+## Публичное распространение
+
+Sayo публикуется как открытый MIT-проект. GitHub Release содержит ZIP, DMG и файл
+SHA-256, но не содержит модель весом 3,1 ГБ. `scripts/download-model.sh` получает
+официальную `ggml-large-v2.bin` из репозитория whisper.cpp на Hugging Face и сверяет
+зафиксированную контрольную сумму. `scripts/setup-dependencies.sh` устанавливает
+`ffmpeg` и `whisper.cpp` через Homebrew и не дублирует уже найденную модель Superwhisper.
+
+До появления Developer ID Application публичные артефакты считаются preview и
+подписываются ad-hoc; это требует ручного подтверждения первого запуска в настройках
+безопасности macOS. Локальная стабильная подпись предназначена только для обновлений на
+текущем Mac и не выдаётся за публично доверенную подпись.
 
 ## Ближайший фокус
 

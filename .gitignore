@@ -1,6 +1,9 @@
 .DS_Store
 .build/
 dist/
+*.dmg
+*.zip
+*.sha256
 .vscode/
 Assets/AppIcon.iconset/
 *.xcuserstate

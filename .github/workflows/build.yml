@@ -1,0 +1,36 @@
+name: Build Sayo
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and package
+        run: ./scripts/package-release.sh
+      - name: Verify app and metadata
+        run: |
+          codesign --verify --deep --strict --verbose=2 dist/Sayo.app
+          plutil -lint dist/Sayo.app/Contents/Info.plist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sayo-macOS-arm64
+          path: dist/releases/*
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/releases/* \
+            --title "Sayo ${GITHUB_REF_NAME#v}" \
+            --generate-notes

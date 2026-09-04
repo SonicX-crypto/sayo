@@ -4,14 +4,26 @@ set -euo pipefail
 SCRIPT_DIR="${0:A:h}"
 cd "$SCRIPT_DIR"
 
-SDK="/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk"
+LOCAL_SDK="/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk"
+if [[ -n "${SAYO_SDK_PATH:-}" ]]; then
+    SDK="$SAYO_SDK_PATH"
+elif [[ -d "$LOCAL_SDK" ]]; then
+    SDK="$LOCAL_SDK"
+else
+    SDK="$(xcrun --sdk macosx --show-sdk-path)"
+fi
 CACHE="/private/tmp/right-command-dictation-module-cache"
 mkdir -p "$SCRIPT_DIR/.build/release" "$CACHE"
 
 STABLE_SIGNING_HASH="B8E2488B2F71C744DB0490CAC7BD009ED540BADC"
 SIGNING_IDENTITY="${SAYO_SIGNING_IDENTITY:-${VOXCOMMAND_SIGNING_IDENTITY:-$STABLE_SIGNING_HASH}}"
 HAS_STABLE_SIGNING_IDENTITY=0
-if security find-identity -v -p codesigning 2>/dev/null | /usr/bin/grep -Fq "$SIGNING_IDENTITY"; then
+if [[ "${SAYO_FORCE_ADHOC_SIGNING:-0}" == "1" ]]; then
+    if [[ "${SAYO_ALLOW_ADHOC_SIGNING:-0}" != "1" ]]; then
+        echo "Ошибка: SAYO_FORCE_ADHOC_SIGNING требует SAYO_ALLOW_ADHOC_SIGNING=1." >&2
+        exit 1
+    fi
+elif security find-identity -v -p codesigning 2>/dev/null | /usr/bin/grep -Fq "$SIGNING_IDENTITY"; then
     HAS_STABLE_SIGNING_IDENTITY=1
 elif [[ "${SAYO_ALLOW_ADHOC_SIGNING:-0}" != "1" ]]; then
     echo "Ошибка: code-signing identity '$SIGNING_IDENTITY' не найдена." >&2

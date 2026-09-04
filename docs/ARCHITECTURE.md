@@ -43,7 +43,9 @@ whisper-server (127.0.0.1:18080, Metal GPU, Whisper Large)
   `hudColorError`;
 - движение и контраст: `hudResponseIntensity`, `hudReduceMotion`,
   `hudIncreaseContrast`;
-- модель: внешняя, только чтение.
+- модель: внешняя, только чтение. Сначала используется путь из `UserDefaults`
+  (`modelPath`), затем `~/Library/Application Support/Sayo/Models/ggml-large-v2.bin`,
+  затем прежний путь Superwhisper.
 
 ## Безопасность и приватность
 
@@ -149,3 +151,15 @@ preview не сохраняются. То же окно, открытое пун
 `SAYO_ALLOW_ADHOC_SIGNING=1` создаёт только тестовую сборку; `install-app.sh` всё равно
 проверяет стабильную identity и подпись до остановки работающего приложения.
 Стабильная identity нужна для сохранения TCC-разрешений при обновлении исполняемого файла.
+
+## Публичная упаковка
+
+`scripts/package-release.sh` создаёт arm64 ZIP, DMG и SHA-256 в `dist/releases`, не
+устанавливая и не запуская приложение. Если `SAYO_RELEASE_SIGNING_IDENTITY` не задана,
+артефакт намеренно подписывается ad-hoc. GitHub Actions выполняет ту же сборку и при
+теге `v*` публикует файлы в Release.
+
+DMG содержит Sayo, ярлык `/Applications`, инструкцию и скрипт установки компонентов.
+Модель не входит в образ: загрузчик получает официальный полный Large v2, проверяет
+SHA-256 и только затем перемещает файл в постоянный каталог. Сервер по-прежнему
+запускается только на `127.0.0.1`.
