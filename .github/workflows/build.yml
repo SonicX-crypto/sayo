@@ -15,14 +15,14 @@ jobs:
   build:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build and package
         run: ./scripts/package-release.sh
       - name: Verify app and metadata
         run: |
           codesign --verify --deep --strict --verbose=2 dist/Sayo.app
           plutil -lint dist/Sayo.app/Contents/Info.plist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Sayo-macOS-arm64
           path: dist/releases/*
