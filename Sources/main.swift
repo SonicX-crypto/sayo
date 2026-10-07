@@ -2189,6 +2189,12 @@ private enum RecognizerState {
     case fallback
 }
 
+private struct RecognitionPlan {
+    var offsetMs = 0
+    var durationMs = 0 // 0 means until the end of the recording
+    var singleWindow = true
+}
+
 private final class DictationController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var modelPath: String {
         let defaults = UserDefaults.standard
@@ -2215,6 +2221,9 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
     private var audioFile: AVAudioFile?
     private var sourceAudioURL: URL?
     private var recognizerServer: Process?
+    // The headless check uses its own port so it never talks to the installed app's server.
+    private let isHeadless = ProcessInfo.processInfo.arguments.contains("--transcribe")
+    private let recognizerPort = ProcessInfo.processInfo.arguments.contains("--transcribe") ? 18081 : 18080
     private let recognizerLock = NSLock()
     private let transcriptionQueue = DispatchQueue(label: "ru.specit.Sayo.transcription", qos: .userInitiated)
     private var recognizerState: RecognizerState = .loading
@@ -2262,6 +2271,12 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             return
         }
 
+        let arguments = ProcessInfo.processInfo.arguments
+        if let index = arguments.firstIndex(of: "--transcribe"), arguments.indices.contains(index + 1) {
+            runHeadlessTranscription(of: URL(fileURLWithPath: arguments[index + 1]))
+            return
+        }
+
         transcriptHistory = UserDefaults.standard.stringArray(forKey: "transcriptHistory") ?? []
         configureMenuBar()
 
@@ -2283,6 +2298,24 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
         startPermissionRecovery()
         requestMicrophonePermission()
         warmUpRecognizerServer()
+    }
+
+    /// Runs the production recognition pipeline on an audio file and prints the transcript.
+    /// Verifies recognition changes without the microphone, HUD or global hotkey.
+    private func runHeadlessTranscription(of input: URL) {
+        transcriptionQueue.async { [self] in
+            var status: Int32 = 0
+            do {
+                let wavURL = try convertToWhisperWAV(input)
+                defer { try? FileManager.default.removeItem(at: wavURL) }
+                print(try transcribe(wavURL))
+            } catch {
+                FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
+                status = 1
+            }
+            stopRecognizerServer()
+            exit(status)
+        }
     }
 
     private func runHUDPreviewCycle() {
@@ -2903,21 +2936,88 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             throw DictationError.missingModel(modelPath)
         }
 
+        let plan = try recognitionPlan(for: input)
+        if isHeadless {
+            FileHandle.standardError.write(Data("plan: \(plan)\n".utf8))
+        }
+
         if ensureRecognizerServerReady(maxWait: 20, stateWhileStarting: .recovering) {
             do {
-                return try transcribeThroughServer(input)
+                return try transcribeThroughServer(input, plan: plan)
             } catch {
                 updateRecognizerState(.recovering)
                 stopRecognizerServer()
                 if ensureRecognizerServerReady(maxWait: 20, stateWhileStarting: .recovering),
-                   let transcript = try? transcribeThroughServer(input) {
+                   let transcript = try? transcribeThroughServer(input, plan: plan) {
                     return transcript
                 }
             }
         }
 
         updateRecognizerState(.fallback)
-        return try transcribeThroughCLI(input)
+        return try transcribeThroughCLI(input, plan: plan)
+    }
+
+    /// Decides which part of the recording to recognize and how.
+    ///
+    /// Whisper reads audio in 30-second windows. Without timestamps every window is decoded
+    /// on its own and whatever the model did not finish is silently dropped, so long
+    /// recordings lose whole sentences. With timestamps the windows are stitched correctly,
+    /// but the model invents text when a window starts or ends with long silence. So silence
+    /// around the speech is skipped, speech that fits one window keeps the timestamp-free
+    /// mode, and longer speech is decoded with timestamps.
+    private func recognitionPlan(for wav: URL) throws -> RecognitionPlan {
+        guard let file = try? AVAudioFile(forReading: wav),
+              let buffer = AVAudioPCMBuffer(
+                  pcmFormat: file.processingFormat,
+                  frameCapacity: AVAudioFrameCount(file.length)
+              ),
+              (try? file.read(into: buffer)) != nil,
+              let samples = buffer.floatChannelData?[0] else {
+            throw DictationError.conversionFailed("WAV не читается")
+        }
+
+        let sampleRate = file.processingFormat.sampleRate
+        let frameCount = Int(buffer.frameLength)
+        let totalMs = Int(Double(frameCount) / sampleRate * 1000)
+        let stepMs = 20
+        let step = Int(sampleRate) * stepMs / 1000
+
+        var levels: [Float] = []
+        var position = 0
+        while position + step <= frameCount {
+            var sum: Float = 0
+            for index in position..<(position + step) {
+                sum += samples[index] * samples[index]
+            }
+            levels.append(10 * log10(max(sum / Float(step), 1e-10)))
+            position += step
+        }
+
+        var startMs = 0
+        var endMs = totalMs
+        if !levels.isEmpty {
+            let sorted = levels.sorted()
+            let noiseFloor = sorted[sorted.count / 10]
+            let speechLevel = sorted[sorted.count * 95 / 100]
+            // A flat level profile cannot separate speech from background: recognize everything.
+            if speechLevel - noiseFloor >= 10 {
+                let threshold = max(noiseFloor + 10, speechLevel - 30)
+                if let first = levels.firstIndex(where: { $0 > threshold }),
+                   let last = levels.lastIndex(where: { $0 > threshold }) {
+                    startMs = max(0, first * stepMs - 500)
+                    endMs = min(totalMs, (last + 1) * stepMs + 500)
+                }
+            }
+        }
+
+        var plan = RecognitionPlan()
+        // Skipping less than a second of silence is not worth altering the request.
+        if startMs >= 1000 { plan.offsetMs = startMs }
+        if totalMs - endMs >= 1000 { plan.durationMs = endMs - plan.offsetMs }
+        let spanMs = plan.durationMs > 0 ? plan.durationMs : totalMs - plan.offsetMs
+        plan.singleWindow = spanMs <= 30_000
+        return plan
     }
 
     private func warmUpRecognizerServer() {
@@ -2962,6 +3062,11 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
                   "/usr/local/bin/whisper-server"
               ]) else { return false }
 
+        // A server orphaned by a crashed or force-quit Sayo would keep the model in memory.
+        _ = runProcess("/usr/bin/pkill", arguments: [
+            "-P", "1", "-f", "whisper-server.*--port \(recognizerPort)"
+        ], timeout: 3)
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: server)
         process.arguments = [
@@ -2970,7 +3075,7 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             "-nt",
             "-t", "8",
             "--host", "127.0.0.1",
-            "--port", "18080"
+            "--port", "\(recognizerPort)"
         ]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -3013,7 +3118,7 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             "--silent", "--show-error", "--fail",
             "--connect-timeout", "1", "--max-time", "2",
             "--output", "/dev/null",
-            "http://127.0.0.1:18080/"
+            "http://127.0.0.1:\(recognizerPort)/"
         ], timeout: 3)
         return result.status == 0
     }
@@ -3049,15 +3154,21 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
         return false
     }
 
-    private func transcribeThroughServer(_ input: URL) throws -> String {
+    private func transcribeThroughServer(_ input: URL, plan: RecognitionPlan) throws -> String {
+        // The server keeps request parameters between calls, so every one is sent explicitly.
         let result = runProcess("/usr/bin/curl", arguments: [
             "--silent", "--show-error", "--fail-with-body",
             "--connect-timeout", "2", "--max-time", "120",
-            "http://127.0.0.1:18080/inference",
+            "http://127.0.0.1:\(recognizerPort)/inference",
             "-F", "file=@\(input.path)",
             "-F", "response_format=json",
-            "-F", "language=auto"
-        ], timeout: 125)
+            "-F", "language=auto",
+            "-F", "offset_t=\(plan.offsetMs)",
+            "-F", "duration=\(plan.durationMs)"
+        ] + (plan.singleWindow
+            ? ["-F", "no_timestamps=true"]
+            : ["-F", "no_timestamps=false", "-F", "token_timestamps=false", "-F", "max_context=0"]
+        ), timeout: 125)
         guard result.status == 0 else {
             throw DictationError.transcriptionFailed(result.stderr)
         }
@@ -3070,7 +3181,7 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
         return try cleanedTranscript(rawText)
     }
 
-    private func transcribeThroughCLI(_ input: URL) throws -> String {
+    private func transcribeThroughCLI(_ input: URL, plan: RecognitionPlan) throws -> String {
         guard let whisper = locateExecutable(candidates: [
             "/opt/homebrew/bin/whisper-cli",
             "/usr/local/bin/whisper-cli"
@@ -3082,9 +3193,11 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             "-m", modelPath,
             "-f", input.path,
             "-l", "auto",
-            "-nt", "-np",
-            "-bo", "2", "-bs", "2"
-        ], timeout: 240)
+            "-np",
+            "-bo", "2", "-bs", "2",
+            "-ot", "\(plan.offsetMs)",
+            "-d", "\(plan.durationMs)"
+        ] + (plan.singleWindow ? ["-nt"] : ["-mc", "0"]), timeout: 240)
         guard result.status == 0 else {
             throw DictationError.transcriptionFailed(result.stderr)
         }
@@ -3095,7 +3208,16 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
     private func cleanedTranscript(_ rawText: String) throws -> String {
         let text = rawText
             .split(separator: "\n")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .map {
+                $0
+                    // whisper-cli prefixes every segment with its time range.
+                    .replacingOccurrences(
+                        of: #"^\[[\d:.]+ --> [\d:.]+\]"#, with: "", options: .regularExpression
+                    )
+                    // Stage remarks such as *смех* are invented by the model on silence.
+                    .replacingOccurrences(of: #"\*[^*]*\*"#, with: "", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
             .filter { !$0.isEmpty && !$0.hasPrefix("[") }
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
