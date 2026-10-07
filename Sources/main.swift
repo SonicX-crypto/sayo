@@ -2193,6 +2193,7 @@ private struct RecognitionPlan {
     var offsetMs = 0
     var durationMs = 0 // 0 means until the end of the recording
     var singleWindow = true
+    var beamSearch = false
 }
 
 private final class DictationController: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -2235,6 +2236,7 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
     private var historyMenu: NSMenu!
     private var themeMenu: NSMenu!
     private var autoPasteItem: NSMenuItem!
+    private var retranscribeLastItem: NSMenuItem!
     private var retryRecoveryItem: NSMenuItem!
     private var discardRecoveryItem: NSMenuItem!
     private var hotkeyStatusItem: NSMenuItem!
@@ -2260,6 +2262,10 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             .appendingPathComponent("Sayo", isDirectory: true)
             .appendingPathComponent("Recovery", isDirectory: true)
     }()
+    // Kept outside the recovery queue: it holds a recognized dictation, not a failed one.
+    private var lastDictationURL: URL {
+        recoveryDirectoryURL.deletingLastPathComponent().appendingPathComponent("LastDictation.caf")
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if ProcessInfo.processInfo.arguments.contains("--preview-settings") {
@@ -2308,7 +2314,7 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             do {
                 let wavURL = try convertToWhisperWAV(input)
                 defer { try? FileManager.default.removeItem(at: wavURL) }
-                print(try transcribe(wavURL))
+                print(try transcribe(wavURL, careful: ProcessInfo.processInfo.arguments.contains("--careful")))
             } catch {
                 FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
                 status = 1
@@ -2412,6 +2418,15 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
         menu.addItem(historyRoot)
         rebuildHistoryMenu()
 
+        retranscribeLastItem = NSMenuItem(
+            title: "Распознать последнюю запись заново",
+            action: #selector(retranscribeLastDictation),
+            keyEquivalent: ""
+        )
+        retranscribeLastItem.target = self
+        retranscribeLastItem.image = menuSymbol("arrow.triangle.2.circlepath")
+        menu.addItem(retranscribeLastItem)
+
         retryRecoveryItem = NSMenuItem(
             title: "Повторить сохранённую запись",
             action: #selector(retryFailedRecording),
@@ -2498,6 +2513,9 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             : (isTranscribing ? "Распознаю…" : "Начать диктовку")
         toggleMenuItem.image = menuSymbol(isRecording ? "stop.circle.fill" : "waveform")
         toggleMenuItem.isEnabled = !isTranscribing
+
+        retranscribeLastItem.isHidden = !FileManager.default.fileExists(atPath: lastDictationURL.path)
+        retranscribeLastItem.isEnabled = !isRecording && !isTranscribing
 
         let recoveryCount = recoverableRecordings().count
         retryRecoveryItem.title = recoveryCount > 1
@@ -2744,6 +2762,20 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
         beginTranscription(of: sourceURL, isRecovery: true)
     }
 
+    @objc private func retranscribeLastDictation() {
+        guard !isRecording, !isTranscribing,
+              FileManager.default.fileExists(atPath: lastDictationURL.path) else { return }
+        beginTranscription(of: lastDictationURL, isRecovery: true, careful: true)
+    }
+
+    /// Keeps the audio of the latest dictation until the next one succeeds, so a poor
+    /// result can be recognized again.
+    private func keepAsLastDictation(_ sourceURL: URL) {
+        guard sourceURL != lastDictationURL else { return }
+        try? FileManager.default.removeItem(at: lastDictationURL)
+        try? FileManager.default.moveItem(at: sourceURL, to: lastDictationURL)
+    }
+
     @objc private func discardFailedRecordings() {
         let recordings = recoverableRecordings()
         guard !recordings.isEmpty else { return }
@@ -2851,7 +2883,7 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
         beginTranscription(of: sourceURL, isRecovery: false)
     }
 
-    private func beginTranscription(of sourceURL: URL, isRecovery: Bool) {
+    private func beginTranscription(of sourceURL: URL, isRecovery: Bool, careful: Bool = false) {
         isTranscribing = true
         setStatus(
             icon: workingIcon,
@@ -2867,11 +2899,11 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             do {
                 let wavURL = try self.convertToWhisperWAV(sourceURL)
                 defer { try? FileManager.default.removeItem(at: wavURL) }
-                let transcript = try self.transcribe(wavURL)
+                let transcript = try self.transcribe(wavURL, careful: careful)
                 DispatchQueue.main.async {
                     self.isTranscribing = false
                     self.copyAndPaste(transcript)
-                    try? FileManager.default.removeItem(at: sourceURL)
+                    self.keepAsLastDictation(sourceURL)
                     self.refreshMenuState()
                 }
             } catch {
@@ -2931,12 +2963,17 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
         return output
     }
 
-    private func transcribe(_ input: URL) throws -> String {
+    private func transcribe(_ input: URL, careful: Bool = false) throws -> String {
         guard FileManager.default.fileExists(atPath: modelPath) else {
             throw DictationError.missingModel(modelPath)
         }
 
-        let plan = try recognitionPlan(for: input)
+        var plan = try recognitionPlan(for: input)
+        if careful {
+            // A repeat must not reproduce the first result: decode the other way, with beam search.
+            plan.singleWindow = false
+            plan.beamSearch = true
+        }
         if isHeadless {
             FileHandle.standardError.write(Data("plan: \(plan)\n".utf8))
         }
@@ -3155,7 +3192,8 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
     }
 
     private func transcribeThroughServer(_ input: URL, plan: RecognitionPlan) throws -> String {
-        // The server keeps request parameters between calls, so every one is sent explicitly.
+        // Every decoding parameter is sent explicitly so the result does not depend on the
+        // flags the running server was started with.
         let result = runProcess("/usr/bin/curl", arguments: [
             "--silent", "--show-error", "--fail-with-body",
             "--connect-timeout", "2", "--max-time", "120",
@@ -3167,7 +3205,9 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             "-F", "duration=\(plan.durationMs)"
         ] + (plan.singleWindow
             ? ["-F", "no_timestamps=true"]
-            : ["-F", "no_timestamps=false", "-F", "token_timestamps=false", "-F", "max_context=0"]
+            : ["-F", "no_timestamps=false", "-F", "token_timestamps=false"]
+                // Greedy decoding is steadier without the previous window's text, beam search with it.
+                + (plan.beamSearch ? ["-F", "beam_size=5"] : ["-F", "max_context=0"])
         ), timeout: 125)
         guard result.status == 0 else {
             throw DictationError.transcriptionFailed(result.stderr)
@@ -3194,10 +3234,10 @@ private final class DictationController: NSObject, NSApplicationDelegate, NSMenu
             "-f", input.path,
             "-l", "auto",
             "-np",
-            "-bo", "2", "-bs", "2",
+            "-bo", "2", "-bs", plan.beamSearch ? "5" : "2",
             "-ot", "\(plan.offsetMs)",
             "-d", "\(plan.durationMs)"
-        ] + (plan.singleWindow ? ["-nt"] : ["-mc", "0"]), timeout: 240)
+        ] + (plan.singleWindow ? ["-nt"] : (plan.beamSearch ? [] : ["-mc", "0"])), timeout: 240)
         guard result.status == 0 else {
             throw DictationError.transcriptionFailed(result.stderr)
         }
